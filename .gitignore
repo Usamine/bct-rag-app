@@ -4,7 +4,7 @@ node_modules/
 venv/
 __pycache__/
 *.pyc
-data/index/
-data/pdfs/*/*.pdf
+backend/data/index/
+backend/data/pdfs/*/*.pdf
 .env
 .env*.local
