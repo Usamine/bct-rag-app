@@ -1,0 +1,10 @@
+node_modules/
+.next/
+.venv/
+venv/
+__pycache__/
+*.pyc
+data/index/
+data/pdfs/*/*.pdf
+.env
+.env*.local
