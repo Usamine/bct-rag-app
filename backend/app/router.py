@@ -1,63 +1,82 @@
-# router.py
 # ---------------------------------------------------------------------------
-# Semantic Router using local bge-m3 embeddings. 
+# Semantic Router using local bge-m3 embeddings.
 # Bypasses the RAG database for conversational queries or greetings.
 # ---------------------------------------------------------------------------
-from typing import Literal
-from . import ollama_client
+from typing import List, Literal, Optional, Tuple
+import numpy as np
 
-# Exemples de phrases types "Hors-Sujet" ou Salutations (Bilingue)
+from . import config, ollama_client
+
+# Exemples de phrases types "Hors-Sujet" ou Salutations (Multilingue)
 CHITCHAT_SAMPLES = [
-    "bonjour", "hello", "salut", "مرحبا", "صباح الخير", "مساء الخير",
-    "comment ça va", "how are you", "tu vas bien",
-    "tu es qui", "who are you", "c'est quoi ton nom",
-    "merci", "thanks", "شكرا", "au revoir", "bye", "à bientot"
+    # Français
+    "bonjour", "hello", "salut", "bonsoir", "slt",
+    "comment ca va", "comment allez vous", "ca va", "tu vas bien",
+    "merci", "merci beaucoup", "un grand merci", "parfait merci",
+    "au revoir", "bye", "a bientot", "bonne journée",
+    "tu es qui", "c'est quoi ton nom", "qui es tu", "presentation",
+
+    # Arabe & Arabizi
+    "مرحبا", "أهلا", "صباح الخير", "مساء الخير", "السلام عليكم",
+    "شكرا", "شكرا جزيلا", "يعطيك الصحة",
+    "kayfa al hal", "labes", "chneya ahwalek", "cv", "aslema", "w rabi m3ak",
+    "chkounek", "man anta", "من أنت",
+
+    # Anglais
+    "hi", "how are you", "how are u doing", "thanks", "thank you",
+    "who are you", "what is your name", "what can you do"
 ]
 
 _chitchat_embeddings = None
 
+
 def _load_router_embeddings():
-    """Lazily embeds the chitchat reference samples once."""
+    """Lazily embeds the chitchat reference samples once per process."""
     global _chitchat_embeddings
     if _chitchat_embeddings is None:
-        # Réutilisation de votre pipeline d'embedding existant
-        _chitchat_embeddings = [ollama_client.embed(text) for text in CHITCHAT_SAMPLES]
+        # embed_batch: one round trip for all samples instead of doing it one by one.
+        _chitchat_embeddings = ollama_client.embed_batch(CHITCHAT_SAMPLES)
     return _chitchat_embeddings
 
 
-def _cosine_similarity(v1, v2) -> float:
-    """Computes the dot product similarity between two vectors."""
-    dot = sum(x * y for x, y in zip(v1, v2))
-    mag1 = sum(x**2 for x in v1) ** 0.5
-    mag2 = sum(x**2 for x in v2) ** 0.5
-    if not mag1 or not mag2:
-        return 0.0
-    return dot / (mag1 * mag2)
-
-
-def route_query(query: str, threshold: float = 0.40) -> Literal["chitchat", "rag"]:
-    """
-    Analyzes the query semantic closeness to standard greetings.
-    Returns 'chitchat' to skip DB retrieval, or 'rag' for regulatory searches.
-    """
+def route_query(
+    query: str,
+    query_vec: Optional[List[float]] = None,
+    threshold: float = None,
+) -> Tuple[Literal["chitchat", "rag"], Optional[List[float]]]:
+    
+    threshold = threshold if threshold is not None else config.ROUTER_THRESHOLD
     clean_q = query.strip().lower()
-    
-    # 1. Sécurité matérielle rapide (évite un appel d'embedding pour les mots simples)
-    if clean_q in ["bonjour", "hello", "salut", "l", "hi", "مرحبا"]:
-        return "chitchat"
-        
-    # 2. Comparaison sémantique vectorielle
-    query_vec = ollama_client.embed(query)
+
+    # 🛑 SÉCURITÉ ANTI-FAUX POSITIFS : 
+    # Si la phrase est longue (ex: plus de 60 caractères), c'est forcément une vraie question.
+    if len(clean_q) > 60:
+        print(f"🧭 [ROUTER] Phrase longue ({len(clean_q)} chars) -> Route forcée : RAG")
+        return "rag", query_vec
+
+    # 1. Détection instantanée... (la suite de votre code reste identique)
+    if clean_q in ["bonjour", "hello", "salut", "hi", "مرحبا", "kayfa al hal", "labes", "cv"]:
+        print(f"🧭 [ROUTER] Exact Match -> Route: CHITCHAT")
+        return "chitchat", query_vec
+
+    # 2. Comparaison sémantique vectorielle via Numpy
+    qvec = query_vec if query_vec is not None else ollama_client.embed(query)
     sample_vecs = _load_router_embeddings()
+
+    q_arr = np.array(qvec)
+    s_arr = np.array(sample_vecs)
     
-    max_score = 0.0
-    for s_vec in sample_vecs:
-        score = _cosine_similarity(query_vec, s_vec)
-        if score > max_score:
-            max_score = score
-            
-    # Si la phrase ressemble de près ou de loin à du bavardage, on déroute
-    if max_score > threshold:
-        return "chitchat"
-        
-    return "rag"
+    # Calcul rapide de la similarité cosinus matricielle
+    dot_products = np.dot(s_arr, q_arr)
+    q_norm = np.linalg.norm(q_arr)
+    s_norms = np.linalg.norm(s_arr, axis=1)
+    
+    scores = dot_products / (q_norm * s_norms + 1e-8)
+    max_score = float(np.max(scores))
+
+    # 3. Décision basée sur le seuil
+    classification = "chitchat" if max_score > threshold else "rag"
+    
+    print(f"🧭 [ROUTER] Score: {max_score:.3f} (Threshold: {threshold}) -> Route: {classification.upper()}")
+    
+    return classification, qvec

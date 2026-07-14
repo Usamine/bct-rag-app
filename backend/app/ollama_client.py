@@ -3,11 +3,12 @@
 import requests
 from typing import List, Dict
 from . import config
+import json
 
 _client = requests.Session()
 
 def embed(text: str) -> List[float]:
-    r = _client.post(f"http://localhost:11434/api/embeddings", json={
+    r = _client.post(f"{config.OLLAMA_URL}/api/embeddings", json={
         "model": config.EMBED_MODEL,
         "prompt": text
     })
@@ -15,27 +16,67 @@ def embed(text: str) -> List[float]:
     return r.json()["embedding"]
 
 
+def embed_batch(texts: List[str]) -> List[List[float]]:
+    """
+    Embed multiple texts in one round trip — this is what indexer.py calls
+    during ingest, so a batch of chunks costs one HTTP call instead of one
+    per chunk.
+
+    Tries Ollama's batched endpoint first (`/api/embed`, which takes
+    `input: list[str]` and returns `embeddings: list[list[float]]`). Falls
+    back to calling `embed()` once per text if that endpoint isn't available
+    (older Ollama versions only expose the single-prompt `/api/embeddings`).
+    Order is preserved either way, which matters since indexer.py zips these
+    vectors back up against `ids`/`metadatas` by position.
+    """
+    if not texts:
+        return []
+    try:
+        r = _client.post(f"{config.OLLAMA_URL}/api/embed", json={
+            "model": config.EMBED_MODEL,
+            "input": texts,
+        })
+        r.raise_for_status()
+        return r.json()["embeddings"]
+    except Exception:
+        return [embed(t) for t in texts]
+
+
 def classify_intent(question: str) -> str:
-    """Classifies the user query into 'BCT' or 'CHAT'."""
-    system_prompt = (
-        "You are a strict query classifier. Analyze the user input.\n"
-        "If the input is a greeting (bonjour, aslema, hi), polite small talk, a definition of your acronym (c'est quoi la BCT, abbreviation bct), "
-        "or completely unrelated to Tunisian banking regulations, output exactly: CHAT\n"
-        "If the input is a legitimate question about laws, circulars, or monetary regulations of the Banque Centrale de Tunisie, output exactly: BCT\n"
-        "Rules: Output ONLY the word CHAT or BCT. No punctuation, no explanations."
-    )
+    """Classifies the user query using Few-Shot Prompting."""
     
-    r = _client.post("http://localhost:11434/api/chat", json={
+    r = _client.post(f"{config.OLLAMA_URL}/api/chat", json={
         "model": config.LLM_MODEL,
         "stream": False,
         "options": {"temperature": 0.0, "num_predict": 5},
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Input: {question}\nClassification:"},
+            {"role": "system", "content": "You are a strict text classifier. You must output EXACTLY and ONLY the word 'CHAT' or 'BCT'. Do not output any other character or explanation."},
+            # --- Début des exemples (Few-Shot) ---
+            {"role": "user", "content": "bonjour"},
+            {"role": "assistant", "content": "CHAT"},
+            {"role": "user", "content": "what day is today"},
+            {"role": "assistant", "content": "CHAT"},
+            {"role": "user", "content": "kayfa al hal"},
+            {"role": "assistant", "content": "CHAT"},
+            {"role": "user", "content": "how are you doing"},
+            {"role": "assistant", "content": "CHAT"},
+            {"role": "user", "content": "quel est le statut de la banque centrale ?"},
+            {"role": "assistant", "content": "BCT"},
+            {"role": "user", "content": "قرار عدد 51"},
+            {"role": "assistant", "content": "BCT"},
+            # --- Fin des exemples ---
+            # La vraie question de l'utilisateur :
+            {"role": "user", "content": question}
         ],
     })
+    
     r.raise_for_status()
-    return r.json()["message"]["content"].strip().upper()
+    intent = r.json()["message"]["content"].strip().upper()
+    
+    # Petite astuce de debug : on affiche ce que le LLM a vraiment répondu dans votre terminal
+    print(f"🧠 [CLASSIFIER] Question: '{question}' -> Intent: {intent}")
+    
+    return intent
 
 
 def condense_question(question: str, history: List[Dict]) -> str:
@@ -66,7 +107,7 @@ def condense_question(question: str, history: List[Dict]) -> str:
         "Rule: Output ONLY the final standalone question. No explanations, no markdown, no quotes."
     )
 
-    r = _client.post("http://localhost:11434/api/chat", json={
+    r = _client.post(f"{config.OLLAMA_URL}/api/chat", json={
         "model": config.LLM_MODEL,
         "stream": False,
         "options": {"temperature": 0.0},
@@ -80,7 +121,7 @@ def condense_question(question: str, history: List[Dict]) -> str:
 
 
 def chat_raw_messages(messages: List[Dict]) -> str:
-    r = _client.post("http://localhost:11434/api/chat", json={
+    r = _client.post(f"{config.OLLAMA_URL}/api/chat", json={
         "model": config.LLM_MODEL,
         "stream": False,
         "options": {"temperature": 0.1, "num_ctx": 4096},
@@ -88,3 +129,29 @@ def chat_raw_messages(messages: List[Dict]) -> str:
     })
     r.raise_for_status()
     return r.json()["message"]["content"]
+
+
+
+def stream_chat_messages(messages: List[Dict]):
+    """
+    Appelle Ollama en mode STREAM et cède (yield) les morceaux de texte 
+    au fur et à mesure de leur génération par le LLM.
+    """
+    r = _client.post(
+        f"{config.OLLAMA_URL}/api/chat", 
+        json={
+            "model": config.LLM_MODEL,
+            "stream": True,  # <-- Activer le streaming d'Ollama
+            "options": {"temperature": 0.1, "num_ctx": 4096},
+            "messages": messages,
+        },
+        stream=True # <-- Activer le streaming HTTP de la bibliothèque requests
+    )
+    r.raise_for_status()
+    
+    for line in r.iter_lines():
+        if line:
+            chunk = json.loads(line.decode("utf-8"))
+            content = chunk.get("message", {}).get("content", "")
+            if content:
+                yield content

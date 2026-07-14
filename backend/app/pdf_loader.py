@@ -1,46 +1,40 @@
 # ---------------------------------------------------------------------------
-# PDF text extraction with OCR fallback.
-# Strategy: PyMuPDF first (fast, accurate for born-digital PDFs).
-# If a page returns too little text, fall back to Tesseract OCR
-# (covers scanned BCT legacy laws/circulars).
+# PDF -> page-level text, via PyMuPDF (fitz) ONLY.
+#
+# Docling has been removed entirely due to repeated out-of-memory errors
+# (std::bad_alloc) on large documents. This fallback relies purely on the
+# native text layer of the PDFs.
 # ---------------------------------------------------------------------------
-import fitz                       # PyMuPDF
-import pytesseract
-from PIL import Image
-import io
-from typing import List, Dict
-from . import config
-
-
-def _page_needs_ocr(text: str, page_area_chars: int = 500) -> bool:
-    """Heuristic: very short extracted text on a normal-sized page → scanned."""
-    return len(text.strip()) < page_area_chars
-
-
-def _ocr_page(page) -> str:
-    """Render the page to an image and run Tesseract (fra+ara)."""
-    pix = page.get_pixmap(dpi=300)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    return pytesseract.image_to_string(img, lang=config.OCR_LANGS)
-
+import fitz  # PyMuPDF
+from typing import Dict, List
 
 def load_pdf(path: str) -> List[Dict]:
     """
-    Open a PDF and return a list of page dicts:
+    Convert one PDF and return page-level dicts:
         { "page": int, "text": str, "source": str }
-    Pages with no readable text trigger an OCR pass automatically.
+        
+    Uses pure PyMuPDF to extract native text. Extremely fast and memory
+    efficient. Skips pages/documents that are purely scanned images.
     """
     pages = []
-    doc = fitz.open(path)
-    for i, page in enumerate(doc, start=1):
-        text = page.get_text("text") or ""
-        if _page_needs_ocr(text):
-            try:
-                text = _ocr_page(page)
-            except Exception as e:
-                # OCR is best-effort; log and keep going.
-                print(f"  [ocr-fail] {path} p.{i}: {e}")
-                text = text or ""
-        pages.append({"page": i, "text": text, "source": path})
-    doc.close()
+    try:
+        # Open the PDF using PyMuPDF
+        doc = fitz.open(path)
+        
+        # Iterate through every page
+        for i, page in enumerate(doc, start=1):
+            text = page.get_text("text") or ""
+            pages.append({"page": i, "text": text.strip(), "source": path})
+            
+        doc.close()
+        
+    except Exception as e:
+        print(f"  [error] Failed to read {path}: {e}")
+        return [{"page": 1, "text": "", "source": path}]
+        
+    # Check if the entire document was basically blank (likely a scanned image)
+    all_text = "".join([p["text"] for p in pages])
+    if len(all_text.strip()) < 50:
+        print(f"  [warn] {path}: No native text found (likely a scan). Skipping.")
+        
     return pages

@@ -30,11 +30,19 @@ export default function Chat() {
     const q = input.trim();
     if (!q || loading) return;
     setInput("");
+
+    // On extrait l'historique AVANT d'ajouter la nouvelle question
+    const historyPayload = messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
+
     setMessages((m) => [...m, { role: "user", content: q }]);
     setLoading(true);
 
     try {
-      const res = await askQuestion(q);
+      // ✅ ON PASSE LA QUESTION ET L'HISTORIQUE !
+      const res = await askQuestion(q, historyPayload);
       setMessages((m) => [
         ...m,
         { role: "assistant", content: res.answer, citations: res.citations },

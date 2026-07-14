@@ -1,15 +1,15 @@
 # ---------------------------------------------------------------------------
-# Hybrid retrieval: dense (Chroma) + sparse (BM25) fused with RRF.
+# Hybrid retrieval: dense (Chroma) + sparse (BM25) fused with RRF + Reranking.
 # Loaded lazily so the FastAPI app starts fast.
 # ---------------------------------------------------------------------------
 import pickle
-from typing import List, Dict, Tuple
-import chromadb
-from . import config, ollama_client, indexer
+from typing import Dict, List, Optional, Tuple
+
+from . import config, indexer, ollama_client
 
 # Module-level caches (loaded once per process).
 _bm25_payload = None
-_collection = None
+_reranker = None
 
 
 def _load_bm25():
@@ -22,31 +22,50 @@ def _load_bm25():
     return _bm25_payload
 
 
-def _load_collection():
-    global _collection
-    if _collection is None:
-        client = chromadb.PersistentClient(path=str(config.CHROMA_PATH))
-        _collection = client.get_or_create_collection(name="bct")
-    return _collection
+def _load_reranker():
+    """Lazy load the Cross-Encoder reranker model to keep startup fast."""
+    global _reranker
+    if _reranker is None:
+        try:
+            from sentence_transformers import CrossEncoder
+            # We use a fast, lightweight open-source reranker
+            model_name = getattr(config, "RERANK_MODEL", "BAAI/bge-reranker-base")
+            _reranker = CrossEncoder(model_name)
+        except ImportError:
+            raise RuntimeError(
+                "La bibliothèque 'sentence-transformers' est manquante. "
+                "Exécutez `pip install sentence-transformers` pour activer le Reranking."
+            )
+    return _reranker
 
 
 # --- individual retrievers -------------------------------------------------
-def dense_search(query: str, k: int) -> List[Tuple[str, Dict]]:
-    """Return [(chunk_id, {text, metadata, score}), …] ordered by similarity."""
-    coll = _load_collection()
-    qvec = ollama_client.embed(query)
+def dense_search(query: str, k: int, query_vec: Optional[List[float]] = None) -> List[Tuple[str, Dict]]:
+    """
+    Return [(chunk_id, {text, metadata, score}), …] ordered by similarity.
+
+    `query_vec` lets a caller pass in an embedding it already computed
+    elseer (e.g. main.py reusing the same vector it used for semantic
+    routing), instead of this function silently re-embedding the same text
+    and doubling the number of round trips to Ollama per request.
+    """
+    # get_collection() reuses indexer's client (same telemetry settings,
+    # same on-disk store) instead of retriever.py spinning up its own
+    # separate PersistentClient pointed at the same path.
+    coll = indexer._get_collection()
+    qvec = query_vec if query_vec is not None else ollama_client.embed(query)
     res = coll.query(query_embeddings=[qvec], n_results=k,
                      include=["documents", "metadatas", "distances"])
     out = []
     for cid, doc, meta, dist in zip(res["ids"][0], res["documents"][0],
                                     res["metadatas"][0], res["distances"][0]):
         score = 1 - dist
-        
-        # 💡 AMÉLIORATION : Seuil de sécurité. Si le score vectoriel est inférieur à 0.35, 
-        # c'est du bruit hors-sujet (comme une recherche sur le mot 'Bonjour'). On l'ignore.
-        if score < 0.35: 
+
+        # Safety threshold: below this cosine similarity, a "hit" is noise
+        # (e.g. an off-topic query still returning the least-bad chunk).
+        if score < config.DENSE_SCORE_THRESHOLD:
             continue
-            
+
         out.append((cid, {"text": doc, "metadata": meta, "score": score}))
     return out
 
@@ -71,12 +90,12 @@ def sparse_search(query: str, k: int) -> List[Tuple[str, Dict]]:
 
 
 # --- Reciprocal Rank Fusion -----------------------------------------------
-def rrf_fuse(rankings: List[List[Tuple[str, Dict]]], k_const: int = config.RRF_K
-             ) -> List[Tuple[str, Dict]]:
+def rrf_fuse(rankings: List[List[Tuple[str, Dict]]], k_const: int = None) -> List[Tuple[str, Dict]]:
     """
     Standard RRF: score(d) = Σ 1/(k + rank_i(d)) across all rankings.
     Returns a single ranked list with the original payload attached.
     """
+    k_const = k_const if k_const is not None else config.RRF_K
     scores: Dict[str, float] = {}
     payloads: Dict[str, Dict] = {}
     for ranking in rankings:
@@ -87,27 +106,58 @@ def rrf_fuse(rankings: List[List[Tuple[str, Dict]]], k_const: int = config.RRF_K
     return [(cid, {**payloads[cid], "rrf": s}) for cid, s in fused]
 
 
-def hybrid_search(query: str) -> List[Dict]:
-    """Top-level retrieval entrypoint used by the API."""
-    # 💡 AMÉLIORATION : Si la requête est ultra-courte (salutations, etc.), inutile de stresser la DB
+def hybrid_search(query: str, query_vec: Optional[List[float]] = None) -> List[Dict]:
+    """
+    Top-level retrieval entrypoint used by the API.
+
+    Uses Dense + Sparse search, fuses them via RRF, reranks the top candidates
+    using a Cross-Encoder, and returns the absolute best chunks.
+    """
     clean_query = query.strip().lower()
-    if len(clean_query) < 4 or clean_query in ["bonjour", "hello", "salut", "مرحبا"]:
+    if len(clean_query) < 4:
         return []
 
-    dense = dense_search(query, config.DENSE_TOP_K)
+    # On demande un peu plus de chunks aux moteurs initiaux pour donner du choix au reranker
+    dense = dense_search(query, config.DENSE_TOP_K, query_vec=query_vec)
     sparse = sparse_search(query, config.SPARSE_TOP_K)
-    
-    # Si les deux moteurs n'ont rien trouvé de pertinent sous le seuil
+
     if not dense and not sparse:
         return []
+
+    # 1. Fusion RRF globale
+    fused = rrf_fuse([dense, sparse])
+
+    # 2. Étape de Reranking (si activée dans la config)
+    use_reranker = getattr(config, "USE_RERANKER", True)
+    rerank_top_k = getattr(config, "RERANK_TOP_K", 25)
+
+    if use_reranker and fused:
+        # On ne garde que les 'X' meilleurs candidats du RRF pour les faire réévaluer par l'IA
+        candidates_to_rerank = fused[:rerank_top_k]
+        reranker = _load_reranker()
+
+        # On prépare les paires (Question, Paragraphe)
+        pairs = [(query, p["text"]) for _, p in candidates_to_rerank]
         
-    fused = rrf_fuse([dense, sparse])[: config.FINAL_TOP_K]
+        # Calcul des nouveaux scores de pertinence absolue
+        rerank_scores = reranker.predict(pairs)
+
+        # On injecte le nouveau score dans chaque élément
+        for idx, (cid, p) in enumerate(candidates_to_rerank):
+            p["rerank_score"] = float(rerank_scores[idx])
+
+        # Tri final basé UNIQUEMENT sur la pertinence sémantique réelle du reranker
+        fused = sorted(candidates_to_rerank, key=lambda x: x[1]["rerank_score"], reverse=True)
+
+    # 3. Découpage final selon la limite fixée pour le LLM
+    fused = fused[: config.FINAL_TOP_K]
+
     return [
         {
             "id": cid,
             "text": p["text"],
             "metadata": p["metadata"],
-            "score": p["rrf"],
+            "score": p.get("rerank_score", p["rrf"]),
         }
         for cid, p in fused
     ]
